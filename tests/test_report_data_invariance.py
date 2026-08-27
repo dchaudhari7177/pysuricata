@@ -429,6 +429,48 @@ def test_the_summarize_payload_is_unchanged(name):
     assert actual == expected
 
 
+def test_stable_is_idempotent():
+    """`_stable` must be a no-op on an already-stable payload.
+
+    The fixtures are now written through `_stable`, and
+    `test_the_summarize_payload_is_unchanged` still applies it to both sides --
+    so a second application must not change anything, or the stored file and
+    the comparison would disagree. Not free: `_values_only` turns
+    `[[k, v], ...]` into `[v, ...]`, and would strip a second time if any
+    surviving value were itself a two-element list.
+    """
+    for name in FRAMES:
+        raw = json.loads(json.dumps(summarize(FRAMES[name](), seed=0), default=str))
+        once = _stable(raw)
+        assert _stable(once) == once, f"_stable is not idempotent on {name}"
+
+
+def test_fixtures_are_stored_stabilised():
+    """What is on disk is what is compared.
+
+    Storing the raw payload meant the files carried fields `_stable` drops --
+    machine-dependent ones that could never be compared, so `--write` churned
+    hundreds of lines and the fixtures recorded whichever machine last ran it.
+    """
+    for name in FRAMES:
+        stored = json.loads((FIXTURES / f"summary_{name}.json").read_text())
+        assert _stable(stored) == stored, (
+            f"summary_{name}.json holds values _stable discards; regenerate with "
+            "`uv run python tests/test_report_data_invariance.py --write`"
+        )
+
+
+def test_process_dependent_keys_are_absent_from_the_fixtures():
+    """Absent, not present-and-ignored, so the file cannot suggest a guarantee
+    it does not make."""
+    exempt = set(_PROCESS_DEPENDENT) | set(_ENVIRONMENT_DEPENDENT)
+    for name in FRAMES:
+        stored = json.loads((FIXTURES / f"summary_{name}.json").read_text())
+        for column, stats in stored.get("columns", {}).items():
+            leaked = sorted(set(stats) & exempt)
+            assert not leaked, f"{name}/{column} still stores exempt keys: {leaked}"
+
+
 def test_nothing_tied_survives_into_the_comparison():
     """A self-check on `_stable`, added after four CI rounds spent discovering
     ties one field at a time.
@@ -555,6 +597,11 @@ def test_every_exemption_still_applies_to_something():
     `sample_scale` that was never in the payload -- so they exempted nothing
     while reading as though they did.
     """
+    # Deliberately a RAW payload, never the stored fixture. The fixtures are
+    # written through `_stable`, which drops exactly the exempt keys -- so
+    # reading one here would make every exemption look unused, or, once the
+    # assertion was "fixed" to match, make this test pass vacuously. Same
+    # class of bug as #201.
     payload = summarize(_frame(), seed=0)
     keys: set[str] = set()
     for stats in payload["columns"].values():
@@ -569,7 +616,18 @@ def _write_fixtures() -> None:
         fingerprint(profile(_frame(), seed=0).html) + "\n", encoding="utf-8"
     )
     for name, builder in FRAMES.items():
-        payload = json.loads(json.dumps(summarize(builder(), seed=0), default=str))
+        # Through `_stable`, not around it: what is stored is exactly what is
+        # compared. Writing the raw payload stored fields `_stable` discards at
+        # comparison time -- float noise below twelve significant figures, and
+        # `min_items`/`max_items` row indices that are arbitrary among ties --
+        # so `--write` produced hundreds of changed lines for a one-key change
+        # and the fixtures silently recorded whichever machine last ran it.
+        #
+        # A diff nobody can read is a diff nobody reads, which is the failure
+        # this file already documents for HTML snapshots.
+        payload = _stable(
+            json.loads(json.dumps(summarize(builder(), seed=0), default=str))
+        )
         (FIXTURES / f"summary_{name}.json").write_text(
             json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
